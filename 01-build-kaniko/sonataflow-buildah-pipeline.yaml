@@ -1,0 +1,224 @@
+---
+# This task is a placeholder for the buildah clustertask until PR https://github.com/tektoncd/operator/pull/2033 is 
+# merged.
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: buildah
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: image-build
+spec:
+  description: >-
+    Buildah task builds source into a container image and
+    then pushes it to a container registry.
+
+    Buildah Task builds source into a container image using Project Atomic's
+    Buildah build tool.It uses Buildah's support for building from Dockerfiles,
+    using its buildah bud command.This command executes the directives in the
+    Dockerfile to assemble a container image, then pushes that image to a
+    container registry.
+
+  params:
+  - name: IMAGE
+    description: Reference of the image buildah will produce.
+  - name: BUILDER_IMAGE
+    description: The location of the buildah builder image.
+    default: registry.redhat.io/rhel8/buildah@sha256:3c2ea396a114221575a4031d90d28c43563f7b96288374e0ba8b22de3ed97b5a
+  - name: STORAGE_DRIVER
+    description: Set buildah storage driver
+    default: vfs
+  - name: DOCKERFILE
+    description: Path to the Dockerfile to build.
+    default: ./Dockerfile
+  - name: CONTEXT
+    description: Path to the directory to use as context.
+    default: .
+  - name: TLSVERIFY
+    description: Verify the TLS on the registry endpoint (for push/pull to a non-TLS registry)
+    default: "true"
+  - name: FORMAT
+    description: The format of the built container, oci or docker
+    default: "oci"
+  - name: BUILD_EXTRA_ARGS
+    description: Extra parameters passed for the build command when building images.
+    default: ""
+  - name: PUSH_EXTRA_ARGS
+    description: Extra parameters passed for the push command when pushing images.
+    type: string
+    default: ""
+  - name: SKIP_PUSH
+    description: Skip pushing the built image
+    default: "false"
+  workspaces:
+  - name: source
+  - name: dockerconfig
+    description: >-
+      An optional workspace that allows providing a .docker/config.json file
+      for Buildah to access the container registry.
+      The file should be placed at the root of the Workspace with name config.json
+      or .dockerconfigjson.
+    optional: true
+  - description: >-
+      An optional workspace that allows providing the entitlement keys
+      for Buildah to access subscription. The mounted workspace contains
+      entitlement.pem and entitlement-key.pem.
+    name: rhel-entitlement
+    optional: true
+    mountPath: /tmp/entitlement
+
+  results:
+  - name: IMAGE_DIGEST
+    description: Digest of the image just built.
+  - name: IMAGE_URL
+    description: Image repository where the built image would be pushed to
+
+  steps:
+  - name: build-and-push
+    image: $(params.BUILDER_IMAGE)
+    workingDir: $(workspaces.source.path)
+    script: |
+      ENTITLEMENT_VOLUME=""
+
+      if [[ "$(workspaces.rhel-entitlement.bound)" == "true" ]]; then
+        ENTITLEMENT_VOLUME="--volume /tmp/entitlement:/etc/pki/entitlement"
+      fi
+
+      buildah bud --storage-driver=$(params.STORAGE_DRIVER) \
+        $ENTITLEMENT_VOLUME $(params.BUILD_EXTRA_ARGS) \
+        --format=$(params.FORMAT) --tls-verify=$(params.TLSVERIFY) \
+        -f $(params.DOCKERFILE) -t $(params.IMAGE) $(params.CONTEXT)
+
+      [[ "$(params.SKIP_PUSH)" == "true" ]] && echo "Push skipped" && exit 0
+
+      if [[ "$(workspaces.dockerconfig.bound)" == "true" ]]; then
+
+        # if config.json exists at workspace root, we use that
+        if test -f "$(workspaces.dockerconfig.path)/config.json"; then
+          export DOCKER_CONFIG="$(workspaces.dockerconfig.path)"
+
+        # else we look for .dockerconfigjson at the root
+        elif test -f "$(workspaces.dockerconfig.path)/.dockerconfigjson"; then
+          cp "$(workspaces.dockerconfig.path)/.dockerconfigjson" "$HOME/.docker/config.json"
+          export DOCKER_CONFIG="$HOME/.docker"
+
+        # need to error out if neither files are present
+        else
+          echo "neither 'config.json' nor '.dockerconfigjson' found at workspace root"
+          exit 1
+        fi
+      fi
+      IMAGE=$(params.IMAGE)
+      buildah --storage-driver=$(params.STORAGE_DRIVER) push \
+        $(params.PUSH_EXTRA_ARGS) --tls-verify=$(params.TLSVERIFY) \
+        --digestfile /tmp/image-digest $IMAGE docker://$IMAGE
+      cat /tmp/image-digest | tee $(results.IMAGE_DIGEST.path)
+      echo -n "$IMAGE" | tee $(results.IMAGE_URL.path)
+    volumeMounts:
+    - name: varlibcontainers
+      mountPath: /var/lib/containers
+    securityContext:
+      capabilities:
+        add: ["SETFCAP"]
+  volumes:
+  - name: varlibcontainers
+    emptyDir: {}
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: sonataflow-buildah-pipeline
+spec:
+  params:
+    - default: 'https://github.com/parodos-dev/serverless-workflows.git'
+      description: url of the git repo for the code of deployment
+      name: GIT_REPOSITORY
+      type: string
+    - default: 'image-registry.openshift-image-registry.svc:5000'
+      description: >-
+        image registry where the image will be pushed, defaults to the internal
+        OCP image registry
+      name: IMAGE_REGISTRY
+      type: string
+    - description: >-
+        name of the sonataflow workflow 
+      name: WORKFLOW_NAME
+      type: string
+  tasks:
+    - name: git-clone
+      params:
+        - name: url
+          value: $(params.GIT_REPOSITORY)
+      taskRef:
+        kind: ClusterTask
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+    - name: collect-workflow-data
+      runAfter:
+        - git-clone
+      params:
+        - name: PATH
+          value: $(workspaces.source.path)/$(params.WORKFLOW_NAME)
+        - name: WORKFLOW_NAME
+          value: $(params.WORKFLOW_NAME)
+      taskSpec:
+        params:
+          - name: PATH
+            type: string
+          - name: WORKFLOW_NAME
+            type: string
+        results:
+          - description: The workflow id in the workflow definition
+            name: workflow-id
+            type: string
+          - description: The workflow version in the workflow definition
+            name: workflow-version
+            type: string
+        spec: null
+        steps:
+          - computeResources: {}
+            image: mikefarah/yq
+            name: run-yq
+            script: |
+              #!/usr/bin/env sh
+              set -eu
+              # printf remove newlines
+              printf %s $(yq -oy '.version // "1.0.0"' $(params.PATH)/$(params.WORKFLOW_NAME).sw.yaml) | tr '[:upper:]' '[:lower:]' | tee "$(results.workflow-version.path)" 
+              printf %s $(yq -oy '.id' $(params.PATH)/$(params.WORKFLOW_NAME).sw.yaml) | tr '[:upper:]' '[:lower:]' | tee "$(results.workflow-id.path)"
+        workspaces:
+          - name: source
+            readOnly: true
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+    - name: buildah
+      params:
+        - name: CONTEXT
+          value: ' '
+        - name: IMAGE
+          value: |
+            $(params.IMAGE_REGISTRY)/$(context.pipelineRun.namespace)/serverless-workflow-$(tasks.collect-workflow-data.results.workflow-id):$(tasks.collect-workflow-data.results.workflow-version)
+        - name: DOCKERFILE
+          value: $(workspaces.source.path)/pipeline/workflow-builder.Dockerfile
+        - name: BUILD_EXTRA_ARGS
+          value: |
+            --ulimit nofile=4096:4096 \
+            --build-arg WF_RESOURCES=$(params.WORKFLOW_NAME)/ \
+            --build-arg QUARKUS_EXTENSIONS=org.kie.kogito:kogito-addons-quarkus-jobs-knative-eventing:999-SNAPSHOT \
+      runAfter:
+        - collect-workflow-data
+      taskRef:
+        kind: Task
+        name: buildah
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+        - name: dockerconfig
+          workspace: dockerconfig          
+  workspaces:
+    - name: shared-workspace
+    - name: dockerconfig

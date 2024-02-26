@@ -1,0 +1,36 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: sonataflow-buildah-pipeline-build-
+  namespace: test
+spec:
+  params:
+  - name: GIT_REPOSITORY
+    value: https://github.com/parodos-dev/serverless-workflows.git
+  - name: IMAGE_REGISTRY
+    value: image-registry.openshift-image-registry.svc:5000
+  - name: WORKFLOW_NAME
+    value: mta
+  pipelineRef:
+    name: sonataflow-buildah-pipeline
+  taskRunTemplate:
+    serviceAccountName: pipeline
+  timeouts:
+    pipeline: 1h0m0s
+  workspaces:
+  - name: shared-workspace
+    volumeClaimTemplate:
+      metadata:
+        creationTimestamp: null
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+        storageClassName: ocs-external-storagecluster-ceph-rbd
+        volumeMode: Filesystem
+      status: {}
+  - name: dockerconfig
+    secret:
+      secretName: push-secret
